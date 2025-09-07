@@ -137,4 +137,49 @@ fi
 echo "$out" | grep -qi "address already in use" || { red "Expected 'address already in use' in error, got:\n$out"; exit 1; }
 green "Same-workspace second bind failed with 'address already in use' as expected."
 
+# Stress test: launch many workspaces with same port and validate isolation via proxy
+STRESS_N="${STRESS_N:-32}"
+STRESS_PORT="${STRESS_PORT:-3200}"
+echo "[stress] Launching $STRESS_N servers on port $STRESS_PORT across distinct workspaces"
+
+# Start servers
+for i in $(seq 1 "$STRESS_N"); do
+  docker exec "$CONTAINER" bash -lc "mkdir -p /root/workspace-$i && echo ok-$i > /root/workspace-$i/index.html && cd /root/workspace-$i && nohup python3 -m http.server $STRESS_PORT --bind 127.0.0.1 >/tmp/ws${i}.log 2>&1 & echo \$! > /tmp/ws${i}.pid"
+done
+
+# Wait for readiness inside container
+for i in $(seq 1 "$STRESS_N"); do
+  for t in $(seq 1 50); do
+    if docker exec "$CONTAINER" bash -lc "cd /root/workspace-$i && curl -sS --fail http://127.0.0.1:$STRESS_PORT | grep -q '^ok-$i$'"; then
+      break
+    fi
+    sleep 0.05
+  done
+  docker exec "$CONTAINER" bash -lc "cd /root/workspace-$i && curl -sS --fail http://127.0.0.1:$STRESS_PORT | grep -q '^ok-$i$'" || { red "workspace-$i did not start correctly"; exit 1; }
+done
+
+green "All $STRESS_N servers inside container are serving distinct content."
+
+# Validate via proxy from host using headers for all workspaces
+echo "[stress] Verifying header routing for $STRESS_N workspaces via proxy"
+for i in $(seq 1 "$STRESS_N"); do
+  body=$(curl -sS -H "X-Cmux-Workspace-Internal: workspace-$i" -H "X-Cmux-Port-Internal: $STRESS_PORT" "http://127.0.0.1:${PORT}/")
+  if [ "$body" != "ok-$i" ]; then
+    red "Header routing mismatch for workspace-$i: expected ok-$i, got: $body"
+    exit 1
+  fi
+done
+green "Header routing verified for $STRESS_N workspaces."
+
+# Spot-check subdomain routing for a few workspaces
+for i in 1 "$STRESS_N" 5 10 15; do
+  if [ "$i" -gt "$STRESS_N" ]; then continue; fi
+  body=$(curl -sS -H "Host: workspace-$i-$STRESS_PORT.localhost" "http://127.0.0.1:${PORT}/")
+  if [ "$body" != "ok-$i" ]; then
+    red "Subdomain routing mismatch for workspace-$i: expected ok-$i, got: $body"
+    exit 1
+  fi
+done
+green "Subdomain routing spot-checks passed."
+
 green "All e2e tests passed."
