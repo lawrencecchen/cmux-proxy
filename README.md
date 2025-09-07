@@ -45,6 +45,8 @@ End-to-end (E2E) bash tests that validate workspace isolation and proxy routing 
   - Verifies isolation inside the container (A works in A, fails in B).
   - From the host, curls the proxy using both header-based routing and subdomain Host routing.
   - Requires Docker and curl on the host.
+  - Stress mode: launches many servers across distinct workspaces and verifies isolation in parallel.
+    - Tunables: `STRESS_N` (default 32), `STRESS_PORT` (default 3200), `STRESS_CONC` (default 16).
 
 This runs `cargo test` in a Debian-based Rust image and pre-adds example loopback IPs in `127.18.0.0/8`.
 

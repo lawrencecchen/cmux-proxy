@@ -140,35 +140,25 @@ green "Same-workspace second bind failed with 'address already in use' as expect
 # Stress test: launch many workspaces with same port and validate isolation via proxy
 STRESS_N="${STRESS_N:-32}"
 STRESS_PORT="${STRESS_PORT:-3200}"
-echo "[stress] Launching $STRESS_N servers on port $STRESS_PORT across distinct workspaces"
+STRESS_CONC="${STRESS_CONC:-16}"
+echo "[stress] Launching $STRESS_N servers on port $STRESS_PORT across distinct workspaces (parallel=$STRESS_CONC)"
 
-# Start servers
-for i in $(seq 1 "$STRESS_N"); do
-  docker exec "$CONTAINER" bash -lc "mkdir -p /root/workspace-$i && echo ok-$i > /root/workspace-$i/index.html && cd /root/workspace-$i && nohup python3 -m http.server $STRESS_PORT --bind 127.0.0.1 >/tmp/ws${i}.log 2>&1 & echo \$! > /tmp/ws${i}.pid"
-done
+# Start servers in parallel to reduce exec overhead
+seq 1 "$STRESS_N" | xargs -n1 -P "$STRESS_CONC" -I{} \
+  docker exec "$CONTAINER" bash -lc \
+    "mkdir -p /root/workspace-{} && echo ok-{} > /root/workspace-{}/index.html && cd /root/workspace-{} && nohup python3 -m http.server $STRESS_PORT --bind 127.0.0.1 >/tmp/ws{}.log 2>&1 &"
 
-# Wait for readiness inside container
-for i in $(seq 1 "$STRESS_N"); do
-  for t in $(seq 1 50); do
-    if docker exec "$CONTAINER" bash -lc "cd /root/workspace-$i && curl -sS --fail http://127.0.0.1:$STRESS_PORT | grep -q '^ok-$i$'"; then
-      break
-    fi
-    sleep 0.05
-  done
-  docker exec "$CONTAINER" bash -lc "cd /root/workspace-$i && curl -sS --fail http://127.0.0.1:$STRESS_PORT | grep -q '^ok-$i$'" || { red "workspace-$i did not start correctly"; exit 1; }
-done
+echo "[stress] Waiting for readiness inside container (parallel=$STRESS_CONC)"
+seq 1 "$STRESS_N" | xargs -n1 -P "$STRESS_CONC" -I{} \
+  docker exec "$CONTAINER" bash -lc \
+    "cd /root/workspace-{} && for t in \$(seq 1 100); do if curl -sS --fail http://127.0.0.1:$STRESS_PORT | grep -q '^ok-{}$'; then exit 0; fi; sleep 0.05; done; echo 'workspace-{} not ready' >&2; exit 1"
 
 green "All $STRESS_N servers inside container are serving distinct content."
 
-# Validate via proxy from host using headers for all workspaces
-echo "[stress] Verifying header routing for $STRESS_N workspaces via proxy"
-for i in $(seq 1 "$STRESS_N"); do
-  body=$(curl -sS -H "X-Cmux-Workspace-Internal: workspace-$i" -H "X-Cmux-Port-Internal: $STRESS_PORT" "http://127.0.0.1:${PORT}/")
-  if [ "$body" != "ok-$i" ]; then
-    red "Header routing mismatch for workspace-$i: expected ok-$i, got: $body"
-    exit 1
-  fi
-done
+# Validate via proxy from host using headers for all workspaces (parallel)
+echo "[stress] Verifying header routing for $STRESS_N workspaces via proxy (parallel=$STRESS_CONC)"
+seq 1 "$STRESS_N" | xargs -n1 -P "$STRESS_CONC" -I{} bash -lc \
+  'body=$(curl -sS -H "X-Cmux-Workspace-Internal: workspace-{}" -H "X-Cmux-Port-Internal: '$STRESS_PORT'" "http://127.0.0.1:'"$PORT"'/"); test "$body" = "ok-{}" || { echo "Header routing mismatch for workspace-{}: $body" >&2; exit 1; }'
 green "Header routing verified for $STRESS_N workspaces."
 
 # Spot-check subdomain routing for a few workspaces
