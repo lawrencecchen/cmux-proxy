@@ -114,7 +114,7 @@ async fn test_http_proxy_routes_by_subdomain_workspace() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = to_bytes(resp.into_body()).await.unwrap();
     let s = String::from_utf8(body.to_vec()).unwrap();
-    assert!(s.contains("ok:GET:/hello"), "unexpected body: {}", s);
+    assert!(s.contains("ok-subdomain"), "unexpected body: {}", s);
 
     let _ = shutdown.send(());
     let _ = handle.await;

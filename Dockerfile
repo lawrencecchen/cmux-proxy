@@ -1,7 +1,7 @@
 FROM rust:1-bookworm AS builder
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends build-essential && \
+    apt-get install -y --no-install-recommends build-essential curl && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -17,7 +17,11 @@ COPY src src
 COPY ldpreload ldpreload
 COPY tests tests
 RUN make -C ldpreload
-RUN cargo build --release
+# Install the preload lib for tests/tools in later stages
+RUN install -m 0755 ldpreload/libworkspace_net.so /usr/local/lib/libworkspace_net.so
+# Pre-build release binary (runtime) and pre-build test deps to warm caches
+RUN cargo build --release \
+ && cargo test --workspace --all-features --no-run --locked
 
 # Minimal runtime image
 FROM debian:bookworm-slim AS runtime
@@ -35,7 +39,5 @@ ENTRYPOINT ["/usr/local/bin/cmux-proxy"]
 # Test image (default)
 FROM builder AS test
 WORKDIR /app
-COPY . .
-RUN make -C ldpreload && install -m 0755 ldpreload/libworkspace_net.so /usr/local/lib/libworkspace_net.so
 ENV LD_PRELOAD=/usr/local/lib/libworkspace_net.so
 RUN cargo test --workspace --all-features -- --nocapture
