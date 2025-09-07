@@ -125,29 +125,37 @@ where
 
 fn get_port_from_header(headers: &HeaderMap) -> Result<u16, Response<Body>> {
     const HDR: &str = "X-Cmux-Port-Internal";
-    let val = headers.get(HDR).ok_or_else(|| {
-        response_with(StatusCode::BAD_REQUEST, format!("missing required header: {}", HDR))
-    })?;
+    if let Some(val) = headers.get(HDR) {
+        let s = val.to_str().map_err(|_| {
+            response_with(StatusCode::BAD_REQUEST, "invalid header value (not UTF-8)".to_string())
+        })?;
 
-    let s = val.to_str().map_err(|_| {
-        response_with(StatusCode::BAD_REQUEST, "invalid header value (not UTF-8)".to_string())
-    })?;
+        let s = s.trim();
+        if s.is_empty() {
+            return Err(response_with(
+                StatusCode::BAD_REQUEST,
+                "header value cannot be empty".to_string(),
+            ));
+        }
 
-    let s = s.trim();
-    if s.is_empty() {
-        return Err(response_with(
-            StatusCode::BAD_REQUEST,
-            "header value cannot be empty".to_string(),
-        ));
+        let port: u16 = s.parse().map_err(|_| {
+            response_with(
+                StatusCode::BAD_REQUEST,
+                "invalid port in X-Cmux-Port-Internal".to_string(),
+            )
+        })?;
+        return Ok(port);
     }
 
-    let port: u16 = s.parse().map_err(|_| {
-        response_with(
-            StatusCode::BAD_REQUEST,
-            "invalid port in X-Cmux-Port-Internal".to_string(),
-        )
-    })?;
-    Ok(port)
+    // Fallback: try parsing from Host subdomain pattern: <workspace>-<port>.localhost[:...]
+    if let Some((_ws, port)) = parse_workspace_port_from_host(headers) {
+        return Ok(port);
+    }
+
+    Err(response_with(
+        StatusCode::BAD_REQUEST,
+        format!("missing required header: {}", HDR),
+    ))
 }
 
 /// Public helper: compute a per-workspace IPv4 address in 127/8 based on a workspace name
@@ -186,20 +194,32 @@ pub fn workspace_ip_from_name(name: &str) -> Option<std::net::Ipv4Addr> {
 
 fn upstream_host_from_headers(headers: &HeaderMap, default_host: &str) -> Result<String, Response<Body>> {
     const HDR_WS: &str = "X-Cmux-Workspace-Internal";
-    match headers.get(HDR_WS) {
-        None => Ok(default_host.to_string()),
-        Some(val) => {
-            let v = val.to_str().map_err(|_| {
-                response_with(StatusCode::BAD_REQUEST, format!("invalid header value (not UTF-8): {}", HDR_WS))
-            })?;
-            let ws = v.trim();
-            if ws.is_empty() {
-                return Err(response_with(StatusCode::BAD_REQUEST, format!("{} cannot be empty", HDR_WS)));
-            }
-            let ip = workspace_ip_from_name(ws).ok_or_else(|| response_with(StatusCode::BAD_REQUEST, format!("invalid workspace name: {}", ws)))?;
-            Ok(ip.to_string())
+    if let Some(val) = headers.get(HDR_WS) {
+        let v = val.to_str().map_err(|_| {
+            response_with(StatusCode::BAD_REQUEST, format!("invalid header value (not UTF-8): {}", HDR_WS))
+        })?;
+        let ws = v.trim();
+        if ws.is_empty() {
+            return Err(response_with(StatusCode::BAD_REQUEST, format!("{} cannot be empty", HDR_WS)));
+        }
+        let ip = workspace_ip_from_name(ws)
+            .ok_or_else(|| response_with(StatusCode::BAD_REQUEST, format!("invalid workspace name: {}", ws)))?;
+        return Ok(ip.to_string());
+    }
+
+    // Fallback: try parsing from subdomain pattern if present
+    if let Some((ws, _port)) = parse_workspace_port_from_host(headers) {
+        if let Some(ip) = workspace_ip_from_name(&ws) {
+            return Ok(ip.to_string());
+        } else {
+            return Err(response_with(
+                StatusCode::BAD_REQUEST,
+                format!("invalid workspace name: {}", ws),
+            ));
         }
     }
+
+    Ok(default_host.to_string())
 }
 
 fn is_upgrade_request(req: &Request<Body>) -> bool {
@@ -254,6 +274,36 @@ fn build_upstream_uri(upstream_host: &str, port: u16, orig: &Uri) -> Result<Uri,
         .unwrap_or("/");
     let uri_str = format!("http://{}:{}{}", upstream_host, port, path_and_query);
     Uri::from_str(&uri_str).map_err(|_| response_with(StatusCode::BAD_GATEWAY, "invalid upstream uri".into()))
+}
+
+// Attempt to parse a pattern like: <workspace>-<port>.localhost[:...]
+// Returns (workspace, port) if found and valid.
+fn parse_workspace_port_from_host(headers: &HeaderMap) -> Option<(String, u16)> {
+    let host_val = headers.get("host")?.to_str().ok()?.trim();
+    if host_val.is_empty() { return None; }
+
+    // Strip optional :port from Host header
+    let host_only = host_val.split_once(':').map(|(h, _)| h).unwrap_or(host_val);
+    let host_lc = host_only.to_ascii_lowercase();
+
+    // Must end with .localhost
+    const SUFFIX: &str = ".localhost";
+    if !host_lc.ends_with(SUFFIX) {
+        return None;
+    }
+
+    // Take the label before .localhost
+    let base_len = host_only.len() - SUFFIX.len();
+    let label = &host_only[..base_len];
+
+    // Expect last '-' separates workspace and port
+    let dash_idx = label.rfind('-')?;
+    let (ws_part, port_part) = label.split_at(dash_idx);
+    // port_part still has leading '-' from split_at
+    let port_str = &port_part[1..];
+    if ws_part.is_empty() || port_str.is_empty() { return None; }
+    let port: u16 = match port_str.parse() { Ok(p) => p, Err(_) => return None };
+    Some((ws_part.to_string(), port))
 }
 
 fn response_with(status: StatusCode, msg: String) -> Response<Body> {

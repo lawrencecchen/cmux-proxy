@@ -42,12 +42,22 @@ Try this in separate shells (inside this container):
      -H "X-Cmux-Port-Internal: 3000" \
      http://127.0.0.1:8080/
 
+4b) Or, use subdomains (no custom headers):
+   # If *.localhost does not resolve here, use a Host header
+   curl -v \
+     -H "Host: workspace-a-3000.localhost" \
+     http://127.0.0.1:8080/
+   curl -v \
+     -H "Host: workspace-b-3000.localhost" \
+     http://127.0.0.1:8080/
+
 5) Sanity: workspace-a curl should NOT return workspace-b content and vice versa.
 
 Tips:
 - Proxy logs: tail -f /tmp/proxy.log
 - LD_PRELOAD in effect: echo $LD_PRELOAD
 - To force a workspace without changing directories: export CMUX_WORKSPACE_INTERNAL=workspace-a
+ - From your host, browsers often resolve *.localhost to 127.0.0.1, so this works: http://workspace-a-3000.localhost:8080/
 
 You are now in an interactive shell. Have fun!\n
 DOC
@@ -57,4 +67,3 @@ echo "Starting cmux-proxy in background..."
 echo "Proxy PID: $!  | Logs: tail -f /tmp/proxy.log"
 exec bash
 '
-

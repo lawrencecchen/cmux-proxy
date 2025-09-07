@@ -85,6 +85,43 @@ async fn test_http_proxy_routes_by_workspace_header() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_http_proxy_routes_by_subdomain_workspace() {
+    // Verify subdomain pattern <workspace>-<port>.localhost maps to workspace IP and port
+    let ws_name = "workspace-a";
+    let ws_ip = workspace_ip_from_name(ws_name).expect("mapping");
+    let port = 3002u16;
+
+    // Start upstream bound to workspace IP:port
+    start_upstream_http_on_fixed(ws_ip, port, "ok-subdomain").await;
+
+    // Start proxy
+    let (proxy_addr, shutdown, handle) = start_proxy(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), "127.0.0.1").await;
+
+    // HTTP client. Connect to proxy by address, but send Host: <workspace>-<port>.localhost
+    let client: Client<HttpConnector, Body> = Client::new();
+    let url = format!("http://{}:{}/hello", proxy_addr.ip(), proxy_addr.port());
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(url)
+        .header("Host", format!("{}-{}.localhost", ws_name, port))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = timeout(Duration::from_secs(5), client.request(req))
+        .await
+        .expect("resp timeout")
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body()).await.unwrap();
+    let s = String::from_utf8(body.to_vec()).unwrap();
+    assert!(s.contains("ok:GET:/hello"), "unexpected body: {}", s);
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_http_proxy_routes_by_workspace_non_numeric() {
     // workspace-c -> hashed mapping
     let ws_name = "workspace-c";
