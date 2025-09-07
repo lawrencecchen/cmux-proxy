@@ -150,6 +150,58 @@ fn get_port_from_header(headers: &HeaderMap) -> Result<u16, Response<Body>> {
     Ok(port)
 }
 
+/// Public helper: compute a per-workspace IPv4 address in 127/8 based on a workspace name
+/// of the form `workspace-N` (N >= 1). If input contains path separators, the last component
+/// is used. Returns None if no trailing digits are found.
+pub fn workspace_ip_from_name(name: &str) -> Option<std::net::Ipv4Addr> {
+    use std::net::Ipv4Addr;
+
+    let base = name.rsplit('/').next().unwrap_or(name);
+    // Extract trailing digits
+    let digits: String = base
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+
+    let n: u32 = if !digits.is_empty() {
+        digits.parse().ok()?
+    } else {
+        // Stable 32-bit FNV-1a hash of lowercase name; map to 16-bit space
+        let mut h: u32 = 0x811C9DC5;
+        for b in base.to_ascii_lowercase().as_bytes() {
+            h ^= *b as u32;
+            h = h.wrapping_mul(0x01000193);
+        }
+        h & 0xFFFF
+    };
+
+    let b2 = ((n >> 8) & 0xFF) as u8;
+    let b3 = (n & 0xFF) as u8;
+    Some(Ipv4Addr::new(127, 18, b2, b3))
+}
+
+fn upstream_host_from_headers(headers: &HeaderMap, default_host: &str) -> Result<String, Response<Body>> {
+    const HDR_WS: &str = "X-Cmux-Workspace-Internal";
+    match headers.get(HDR_WS) {
+        None => Ok(default_host.to_string()),
+        Some(val) => {
+            let v = val.to_str().map_err(|_| {
+                response_with(StatusCode::BAD_REQUEST, format!("invalid header value (not UTF-8): {}", HDR_WS))
+            })?;
+            let ws = v.trim();
+            if ws.is_empty() {
+                return Err(response_with(StatusCode::BAD_REQUEST, format!("{} cannot be empty", HDR_WS)));
+            }
+            let ip = workspace_ip_from_name(ws).ok_or_else(|| response_with(StatusCode::BAD_REQUEST, format!("invalid workspace name: {}", ws)))?;
+            Ok(ip.to_string())
+        }
+    }
+}
+
 fn is_upgrade_request(req: &Request<Body>) -> bool {
     if req.method() == Method::CONNECT {
         return true;
@@ -178,6 +230,7 @@ fn strip_hop_by_hop_headers(h: &mut HeaderMap) {
         "upgrade",
         "proxy-connection",
         "x-cmux-port-internal",
+        "x-cmux-workspace-internal",
     ];
     for name in HOP_HEADERS {
         h.remove(*name);
@@ -248,7 +301,8 @@ async fn handle_http(
     req: &mut Request<Body>,
 ) -> Result<Response<Body>, Response<Body>> {
     let port = get_port_from_header(req.headers())?;
-    let uri = build_upstream_uri(&cfg.upstream_host, port, req.uri())?;
+    let upstream_host = upstream_host_from_headers(req.headers(), &cfg.upstream_host)?;
+    let uri = build_upstream_uri(&upstream_host, port, req.uri())?;
 
     // Build proxied request
     let body = std::mem::replace(req.body_mut(), Body::empty());
@@ -261,7 +315,7 @@ async fn handle_http(
 
     // Copy headers
     for (name, value) in req.headers().iter() {
-        if name.as_str().eq_ignore_ascii_case("x-cmux-port-internal") {
+        if name.as_str().eq_ignore_ascii_case("x-cmux-port-internal") || name.as_str().eq_ignore_ascii_case("x-cmux-workspace-internal") {
             continue;
         }
         new_req.headers_mut().insert(name, value.clone());
@@ -275,6 +329,7 @@ async fn handle_http(
         method = %new_req.method(),
         path = %req.uri().path(),
         port = port,
+        upstream = %upstream_host,
         "proxy http"
     );
 
@@ -310,7 +365,8 @@ async fn handle_upgrade(
     // Treat as reverse-proxied upgrade (e.g., WebSocket). We forward the request to upstream,
     // then mirror the 101 response headers to the client and tunnel bytes between both upgrades.
     let port = get_port_from_header(req.headers())?;
-    let upstream_uri = build_upstream_uri(&cfg.upstream_host, port, req.uri())?;
+    let upstream_host = upstream_host_from_headers(req.headers(), &cfg.upstream_host)?;
+    let upstream_uri = build_upstream_uri(&upstream_host, port, req.uri())?;
 
     // Build proxied request for upstream
     let body = std::mem::replace(req.body_mut(), Body::empty());
@@ -323,7 +379,7 @@ async fn handle_upgrade(
 
     // Copy headers (keep upgrade headers)
     for (name, value) in req.headers().iter() {
-        if name.as_str().eq_ignore_ascii_case("x-cmux-port-internal") {
+        if name.as_str().eq_ignore_ascii_case("x-cmux-port-internal") || name.as_str().eq_ignore_ascii_case("x-cmux-workspace-internal") {
             continue;
         }
         proxied_req.headers_mut().insert(name, value.clone());
@@ -335,7 +391,7 @@ async fn handle_upgrade(
     proxied_req.headers_mut().remove("transfer-encoding");
     proxied_req.headers_mut().remove("trailers");
 
-    info!(client = %remote_addr, port = port, "proxy upgrade (e.g. websocket)");
+    info!(client = %remote_addr, port = port, upstream = %upstream_host, "proxy upgrade (e.g. websocket)");
 
     // Send to upstream and get its response (should be 101)
     let upstream_resp = client
@@ -397,7 +453,8 @@ async fn handle_connect(
     remote_addr: SocketAddr,
 ) -> Result<Response<Body>, Response<Body>> {
     let port = get_port_from_header(req.headers())?;
-    let target = format!("{}:{}", cfg.upstream_host, port);
+    let upstream_host = upstream_host_from_headers(req.headers(), &cfg.upstream_host)?;
+    let target = format!("{}:{}", upstream_host, port);
     info!(client = %remote_addr, %target, "tcp tunnel via CONNECT");
 
     // Respond that the connection is established; then upgrade to a raw tunnel
