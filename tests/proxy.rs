@@ -12,6 +12,76 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::time::timeout;
+use futures_util::{StreamExt, SinkExt};
+
+async fn start_upstream_real_ws_echo() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    use tokio_tungstenite::accept_async;
+
+    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await.unwrap();
+    let local = listener.local_addr().unwrap();
+
+    let handle = tokio::spawn(async move {
+        // Accept a single WebSocket connection and echo frames
+        if let Ok((stream, _addr)) = listener.accept().await {
+            match accept_async(stream).await {
+                Ok(mut ws) => {
+                    while let Some(msg) = ws.next().await {
+                        match msg {
+                            Ok(m) => {
+                                if m.is_close() { break; }
+                                if m.is_text() || m.is_binary() {
+                                    if ws.send(m).await.is_err() { break; }
+                                } else if let tungstenite::Message::Ping(p) = m {
+                                    // Reply to ping with pong
+                                    if ws.send(tungstenite::Message::Pong(p)).await.is_err() { break; }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    });
+
+    (local, handle)
+}
+
+async fn start_upstream_real_ws_echo_multi() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    use tokio_tungstenite::accept_async;
+
+    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await.unwrap();
+    let local = listener.local_addr().unwrap();
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let (stream, _addr) = match listener.accept().await { Ok(s) => s, Err(_) => break };
+            tokio::spawn(async move {
+                match accept_async(stream).await {
+                    Ok(mut ws) => {
+                        while let Some(msg) = ws.next().await {
+                            match msg {
+                                Ok(m) => {
+                                    if m.is_close() { break; }
+                                    if m.is_text() || m.is_binary() {
+                                        if ws.send(m).await.is_err() { break; }
+                                    } else if let tungstenite::Message::Ping(p) = m {
+                                        let _ = ws.send(tungstenite::Message::Pong(p)).await;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                    Err(_) => {}
+                }
+            });
+        }
+    });
+
+    (local, handle)
+}
 
 async fn start_upstream_http() -> SocketAddr {
     let make_svc = make_service_fn(|_conn| async move {
@@ -212,6 +282,127 @@ async fn test_connect_tcp_tunnel() {
     timeout(Duration::from_secs(5), stream.read_exact(&mut recv)).await.expect("echo timeout").unwrap();
     assert_eq!(&recv, payload);
 
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_websocket_end_to_end_frames() {
+    use tokio_tungstenite::connect_async;
+    use tungstenite::client::IntoClientRequest;
+
+    // Start real WebSocket upstream and proxy
+    let (ws_addr, _ws_handle) = start_upstream_real_ws_echo().await;
+    let (proxy_addr, shutdown, handle) = start_proxy(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), "127.0.0.1").await;
+
+    // Build a WebSocket client request to the proxy, adding routing header
+    let url = format!("ws://{}:{}/ws", proxy_addr.ip(), proxy_addr.port());
+    let mut req = url.into_client_request().unwrap();
+    req.headers_mut().insert(
+        "X-Cmux-Port-Internal",
+        ws_addr.port().to_string().parse().unwrap(),
+    );
+
+    // Connect and perform WebSocket handshake via proxy
+    let (mut ws, _resp) = timeout(Duration::from_secs(5), connect_async(req))
+        .await
+        .expect("ws connect timeout")
+        .expect("ws connect failed");
+
+    // Send and receive text frame
+    ws.send(tungstenite::Message::Text("hello-ws".into())).await.unwrap();
+    let msg = timeout(Duration::from_secs(5), ws.next()).await.expect("ws recv timeout").unwrap().unwrap();
+    assert!(msg.is_text());
+    assert_eq!(msg.into_text().unwrap(), "hello-ws");
+
+    // Send and receive binary frame
+    ws.send(tungstenite::Message::Binary(vec![1,2,3,4])).await.unwrap();
+    let msg = timeout(Duration::from_secs(5), ws.next()).await.expect("ws recv timeout").unwrap().unwrap();
+    assert!(msg.is_binary());
+    assert_eq!(msg.into_data(), vec![1,2,3,4]);
+
+    // Close
+    let _ = ws.close(None).await;
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_websocket_ping_pong_forwarding() {
+    use tokio_tungstenite::connect_async;
+    use tungstenite::client::IntoClientRequest;
+
+    let (ws_addr, _ws_handle) = start_upstream_real_ws_echo().await;
+    let (proxy_addr, shutdown, handle) = start_proxy(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), "127.0.0.1").await;
+
+    // Connect via proxy
+    let url = format!("ws://{}:{}/ws", proxy_addr.ip(), proxy_addr.port());
+    let mut req = url.into_client_request().unwrap();
+    req.headers_mut().insert(
+        "X-Cmux-Port-Internal",
+        ws_addr.port().to_string().parse().unwrap(),
+    );
+    let (mut ws, _resp) = timeout(Duration::from_secs(5), connect_async(req))
+        .await
+        .expect("ws connect timeout")
+        .expect("ws connect failed");
+
+    // Send a ping; expect a pong with same payload
+    let payload = b"pp".to_vec();
+    ws.send(tungstenite::Message::Ping(payload.clone())).await.unwrap();
+    let msg = timeout(Duration::from_secs(5), ws.next()).await.expect("pong recv timeout").unwrap().unwrap();
+    assert!(matches!(msg, tungstenite::Message::Pong(p) if p == payload));
+
+    let _ = ws.close(None).await;
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_concurrent_websocket_connections() {
+    use tokio_tungstenite::connect_async;
+    use tungstenite::client::IntoClientRequest;
+
+    let (ws_addr, ws_handle) = start_upstream_real_ws_echo_multi().await;
+    let (proxy_addr, shutdown, handle) = start_proxy(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), "127.0.0.1").await;
+
+    let n = 16usize;
+    let mut tasks = Vec::new();
+    for i in 0..n {
+        let proxy_addr = proxy_addr.clone();
+        let ws_port = ws_addr.port();
+        tasks.push(tokio::spawn(async move {
+            let url = format!("ws://{}:{}/ws", proxy_addr.ip(), proxy_addr.port());
+            let mut req = url.into_client_request().unwrap();
+            req.headers_mut().insert(
+                "X-Cmux-Port-Internal",
+                ws_port.to_string().parse().unwrap(),
+            );
+            let (mut ws, _resp) = timeout(Duration::from_secs(5), connect_async(req))
+                .await
+                .expect("connect timeout")
+                .expect("connect failed");
+
+            // Each client sends a unique message and expects echo back
+            let msg_text = format!("hello-{}", i);
+            ws.send(tungstenite::Message::Text(msg_text.clone())).await.unwrap();
+            let msg = timeout(Duration::from_secs(5), ws.next()).await.expect("recv timeout").unwrap().unwrap();
+            assert!(msg.is_text());
+            assert_eq!(msg.into_text().unwrap(), msg_text);
+
+            // Close cleanly
+            let _ = ws.close(None).await;
+            Ok::<(), ()>(())
+        }));
+    }
+
+    for t in tasks {
+        t.await.unwrap().unwrap_or(());
+    }
+
+    // Shutdown
+    ws_handle.abort();
     let _ = shutdown.send(());
     let _ = handle.await;
 }
