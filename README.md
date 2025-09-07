@@ -8,6 +8,18 @@ Header-based reverse proxy that routes to different local ports based on the `X-
 
 This is useful for multiplexing multiple local services behind a single port while choosing the target by header.
 
+## Installation (Linux)
+
+- One-liner (latest release):
+  - `curl -fsSL https://raw.githubusercontent.com/lawrencecchen/cmux-proxy/main/scripts/install.sh | bash`
+  - Optionally pin a version: `CMUX_PROXY_VERSION=v0.0.1 curl -fsSL https://raw.githubusercontent.com/lawrencecchen/cmux-proxy/main/scripts/install.sh | bash`
+- Docker (multi-arch):
+  - `docker run --rm -p 8080:8080 ghcr.io/lawrencecchen/cmux-proxy:latest`
+
+Notes:
+- The installer puts `cmux-proxy` in `/usr/local/bin` by default. Override with `CMUX_PROXY_BIN_DIR`.
+- Architectures supported by the installer: `x86_64` and `aarch64`.
+
 ## Build and Run
 
 - Build: `cargo build --release`
