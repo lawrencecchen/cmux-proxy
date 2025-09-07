@@ -110,5 +110,31 @@ test "$body" = "ok-B" || { red "Expected 'ok-B' via headers (B), got: $body"; ex
 body=$(curl -sS -H "Host: ${WS_B}-3000.localhost" "http://127.0.0.1:${PORT}/")
 test "$body" = "ok-B" || { red "Expected 'ok-B' via subdomain (B), got: $body"; exit 1; }
 
-green "All e2e tests passed."
+# Additional validations
+echo "[9/9] Validate two servers on same port in different workspaces"
+docker exec "$CONTAINER" bash -lc "cd /root/$WS_A && curl -sS --fail http://127.0.0.1:3000 | grep -q '^ok-A$'"
+docker exec "$CONTAINER" bash -lc "cd /root/$WS_B && curl -sS --fail http://127.0.0.1:3000 | grep -q '^ok-B$'"
+green "A:3000 and B:3000 both serve their own content (no conflict)."
 
+echo "[9/9] Validate two servers on same port in the SAME workspace fail"
+docker exec "$CONTAINER" bash -lc "mkdir -p /root/workspace-c && echo ok-C > /root/workspace-c/index.html && cd /root/workspace-c && nohup python3 -m http.server 3000 --bind 127.0.0.1 >/tmp/c1.log 2>&1 & echo \$! > /tmp/c1.pid"
+for i in $(seq 1 50); do
+  if docker exec "$CONTAINER" bash -lc "cd /root/workspace-c && curl -sS --fail http://127.0.0.1:3000 >/dev/null"; then
+    break
+  fi
+  sleep 0.1
+done
+
+set +e
+out=$(docker exec "$CONTAINER" bash -lc "cd /root/workspace-c && python3 -m http.server 3000 --bind 127.0.0.1" 2>&1)
+rc=$?
+set -e
+if [ $rc -eq 0 ]; then
+  red "Second server in same workspace unexpectedly succeeded"
+  echo "$out"
+  exit 1
+fi
+echo "$out" | grep -qi "address already in use" || { red "Expected 'address already in use' in error, got:\n$out"; exit 1; }
+green "Same-workspace second bind failed with 'address already in use' as expected."
+
+green "All e2e tests passed."
