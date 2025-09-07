@@ -3,7 +3,6 @@ use std::net::{SocketAddr, Ipv4Addr, IpAddr};
 use clap::Parser;
 use tracing::info;
 
-use cmux_proxy::ProxyConfig;
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about = "Header-based proxy for HTTP, WS, and TCP (CONNECT)")]
@@ -50,7 +49,7 @@ async fn main() {
 }
 // server logic moved to library
 
-fn dedupe_wildcard_v4(mut listens: Vec<SocketAddr>) -> Vec<SocketAddr> {
+fn dedupe_wildcard_v4(listens: Vec<SocketAddr>) -> Vec<SocketAddr> {
     let mut result = Vec::new();
     for addr in listens.into_iter() {
         match addr.ip() {

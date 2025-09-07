@@ -118,7 +118,7 @@ async fn test_http_proxy_routes_by_header() {
     // Build client
     let client: Client<HttpConnector, Body> = Client::new();
     let url = format!("http://{}:{}/hello", proxy_addr.ip(), proxy_addr.port());
-    let mut req = Request::builder()
+    let req = Request::builder()
         .method("GET")
         .uri(url)
         .header("X-Cmux-Port-Internal", upstream_addr.port().to_string())
