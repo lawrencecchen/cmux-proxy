@@ -172,4 +172,50 @@ for i in 1 "$STRESS_N" 5 10 15; do
 done
 green "Subdomain routing spot-checks passed."
 
+# Postgres in-container test using LD_PRELOAD workspace isolation
+echo "[pg] Setting up PostgreSQL in $WS_A and verifying connectivity"
+
+# Initialize a dedicated data directory owned by postgres
+docker exec "$CONTAINER" bash -lc "install -d -o postgres -g postgres -m 700 /var/lib/postgresql/ws-a"
+
+# Initialize cluster with trust auth to simplify testing
+docker exec "$CONTAINER" bash -lc "PGBIN=\"/usr/lib/postgresql/15/bin\"; su -s /bin/bash postgres -c \"env LD_PRELOAD=/usr/local/lib/libworkspace_net.so CMUX_WORKSPACE_INTERNAL=$WS_A \$PGBIN/initdb -D /var/lib/postgresql/ws-a --no-locale -A trust\""
+# Allow connections from any 127/8 address (workspace IPs)
+docker exec "$CONTAINER" bash -lc "echo 'host all all 127.0.0.0/8 trust' >> /var/lib/postgresql/ws-a/pg_hba.conf"
+
+# Start postgres bound to 127.0.0.1 (shim rewrites to workspace IP for the server); separate unix_socket dir to avoid conflicts
+docker exec "$CONTAINER" bash -lc "install -d -o postgres -g postgres -m 755 /tmp/pg-a; PGBIN=\"/usr/lib/postgresql/15/bin\"; su -s /bin/bash postgres -c \"env LD_PRELOAD=/usr/local/lib/libworkspace_net.so CMUX_WORKSPACE_INTERNAL=$WS_A \$PGBIN/postgres -D /var/lib/postgresql/ws-a -h 127.0.0.1 -p 5432 -k /tmp/pg-a >/tmp/pg-a.log 2>&1 &\""
+
+echo "Waiting for PostgreSQL to become ready in $WS_A"
+docker exec "$CONTAINER" bash -lc 'for i in $(seq 1 100); do CMUX_WORKSPACE_INTERNAL='"$WS_A"' PGHOST=127.0.0.1 PGPORT=5432 psql -U postgres -d postgres -tAc "SELECT 1" >/dev/null 2>&1 && exit 0; sleep 0.1; done; echo "postgres not ready" >&2; tail -n +1 /tmp/pg-a.log 2>/dev/null || true; exit 1'
+
+# Inside workspace A, connecting to 127.0.0.1 should hit workspace IP and succeed
+docker exec "$CONTAINER" bash -lc "cd /root/$WS_A && PGHOST=127.0.0.1 PGPORT=5432 psql -U postgres -d postgres -tAc 'SELECT 42' | grep -q '^42$'"
+green "psql inside $WS_A connected successfully via 127.0.0.1 (remapped)."
+
+# Start a second isolated PostgreSQL instance in workspace B on the same port
+echo "[pg] Setting up PostgreSQL in $WS_B as an independent instance on the same port"
+docker exec "$CONTAINER" bash -lc "install -d -o postgres -g postgres -m 700 /var/lib/postgresql/ws-b"
+docker exec "$CONTAINER" bash -lc "PGBIN=\"/usr/lib/postgresql/15/bin\"; su -s /bin/bash postgres -c \"env LD_PRELOAD=/usr/local/lib/libworkspace_net.so CMUX_WORKSPACE_INTERNAL=$WS_B \$PGBIN/initdb -D /var/lib/postgresql/ws-b --no-locale -A trust\""
+docker exec "$CONTAINER" bash -lc "echo 'host all all 127.0.0.0/8 trust' >> /var/lib/postgresql/ws-b/pg_hba.conf"
+docker exec "$CONTAINER" bash -lc "install -d -o postgres -g postgres -m 755 /tmp/pg-b; PGBIN=\"/usr/lib/postgresql/15/bin\"; su -s /bin/bash postgres -c \"env LD_PRELOAD=/usr/local/lib/libworkspace_net.so CMUX_WORKSPACE_INTERNAL=$WS_B \$PGBIN/postgres -D /var/lib/postgresql/ws-b -h 127.0.0.1 -p 5432 -k /tmp/pg-b >/tmp/pg-b.log 2>&1 &\""
+
+echo "Waiting for PostgreSQL to become ready in $WS_B"
+docker exec "$CONTAINER" bash -lc 'for i in $(seq 1 100); do CMUX_WORKSPACE_INTERNAL='"$WS_B"' PGHOST=127.0.0.1 PGPORT=5432 psql -U postgres -d postgres -tAc "SELECT 1" >/dev/null 2>&1 && exit 0; sleep 0.1; done; echo "postgres B not ready" >&2; tail -n +1 /tmp/pg-b.log 2>/dev/null || true; exit 1'
+
+# Now validate isolation by writing distinct data in each and verifying no cross-contamination
+echo "[pg] Creating tables and inserting data in each isolated instance"
+docker exec "$CONTAINER" bash -lc "cd /root/$WS_A && PGHOST=127.0.0.1 PGPORT=5432 psql -U postgres -d postgres -v ON_ERROR_STOP=1 -c 'CREATE TABLE IF NOT EXISTS iso(k text);' -c \"INSERT INTO iso(k) VALUES('A');\""
+docker exec "$CONTAINER" bash -lc "cd /root/$WS_B && PGHOST=127.0.0.1 PGPORT=5432 psql -U postgres -d postgres -v ON_ERROR_STOP=1 -c 'CREATE TABLE IF NOT EXISTS iso(k text);' -c \"INSERT INTO iso(k) VALUES('B');\""
+
+# Verify A sees only 'A'
+docker exec "$CONTAINER" bash -lc "cd /root/$WS_A && PGHOST=127.0.0.1 PGPORT=5432 psql -U postgres -d postgres -tAc \"SELECT COUNT(*) FROM iso WHERE k='A'\" | grep -q '^1$'"
+docker exec "$CONTAINER" bash -lc "cd /root/$WS_A && PGHOST=127.0.0.1 PGPORT=5432 psql -U postgres -d postgres -tAc \"SELECT COUNT(*) FROM iso WHERE k='B'\" | grep -q '^0$'"
+
+# Verify B sees only 'B'
+docker exec "$CONTAINER" bash -lc "cd /root/$WS_B && PGHOST=127.0.0.1 PGPORT=5432 psql -U postgres -d postgres -tAc \"SELECT COUNT(*) FROM iso WHERE k='B'\" | grep -q '^1$'"
+docker exec "$CONTAINER" bash -lc "cd /root/$WS_B && PGHOST=127.0.0.1 PGPORT=5432 psql -U postgres -d postgres -tAc \"SELECT COUNT(*) FROM iso WHERE k='A'\" | grep -q '^0$'"
+
+green "Postgres isolation verified: two instances on same port without cross-contamination."
+
 green "All e2e tests passed."

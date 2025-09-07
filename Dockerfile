@@ -26,7 +26,15 @@ RUN cargo build --release \
 # Minimal runtime image
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates python3 curl unzip tmux && \
+    apt-get install -y --no-install-recommends \
+      ca-certificates \
+      bash \
+      python3 \
+      curl \
+      unzip \
+      tmux \
+      postgresql \
+      postgresql-client && \
     rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/cmux-proxy /usr/local/bin/cmux-proxy
 COPY --from=builder /app/ldpreload/libworkspace_net.so /usr/local/lib/libworkspace_net.so
