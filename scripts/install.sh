@@ -28,10 +28,10 @@ arch=$(uname -m)
 case "$arch" in
   x86_64|amd64)
     target="x86_64-unknown-linux-gnu" ;;
-  aarch64|arm64)
-    target="aarch64-unknown-linux-gnu" ;;
   *)
-    echo "Unsupported architecture: $arch" >&2; exit 1 ;;
+    echo "Unsupported architecture: $arch" >&2
+    echo "You can build from source: \n  cargo build --release && sudo cp target/release/${BIN_NAME} ${BIN_DIR}" >&2
+    exit 1 ;;
 esac
 
 tmpdir="$(mktemp -d)"
@@ -74,4 +74,3 @@ fi
 
 echo "Installed $dest"
 "$dest" --version || true
-
